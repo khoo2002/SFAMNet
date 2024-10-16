@@ -13,17 +13,17 @@ class Net_3D_MEAN(nn.Module):
                           kernel_size=1, stride=stride, bias=False),
             )
         layers = []
-        layers.append(block(inplanes, planes, stride, downsample, use_TripletAttention=att_type=='TripletAttention'))
+        layers.append(block(inplanes, planes, stride, downsample, use_cbam=att_type=='CBAM'))
         inplanes = planes * block.expansion
         for i in range(1, blocks):
-            layers.append(block(inplanes, planes, use_TripletAttention=att_type=='TripletAttention'))
+            layers.append(block(inplanes, planes, use_cbam=att_type=='CBAM'))
         return nn.Sequential(*layers)
 
     def __init__(self, in_channels=1, out_channels=4):
         super(Net_3D_MEAN, self).__init__()
-        self.c1 = self._make_layer(BasicBlock, 3,  1, att_type='TripletAttention')
-        self.c2 = self._make_layer(BasicBlock, 3,  1, att_type='TripletAttention')
-        self.c3 = self._make_layer(BasicBlock, 3,  1, att_type='TripletAttention')
+        self.c1 = self._make_layer(BasicBlock, 3,  1, att_type='CBAM')
+        self.c2 = self._make_layer(BasicBlock, 3,  1, att_type='CBAM')
+        self.c3 = self._make_layer(BasicBlock, 3,  1, att_type='CBAM')
         self.maxpool1 = nn.MaxPool2d(kernel_size=3, stride=3, padding=0)
         self.maxpool2 = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.avgpool2 = nn.AvgPool2d(kernel_size=2, stride=2, padding=0)
@@ -56,6 +56,7 @@ class Net_3D_MEAN(nn.Module):
         x_recog = self.fc_recog(x2)
         return x_spot, x_recog
 
+# CBAM
 class BasicConv(nn.Module):
     def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True, bn=True, bias=False):
         super(BasicConv, self).__init__()
@@ -74,51 +75,77 @@ class Flatten(nn.Module):
     def forward(self, x):
         return x.view(x.size(0), -1)
 
-class ZPool(nn.Module):
+class ChannelGate(nn.Module):
+    def __init__(self, gate_channels, reduction_ratio=16, pool_types=['avg', 'max']):
+        super(ChannelGate, self).__init__()
+        self.gate_channels = gate_channels
+        self.mlp = nn.Sequential(
+            Flatten(),
+            nn.Linear(gate_channels, gate_channels // reduction_ratio),
+            nn.ReLU(),
+            nn.Linear(gate_channels // reduction_ratio, gate_channels)
+            )
+        self.pool_types = pool_types
     def forward(self, x):
-        return torch.cat(
-            (torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1
-        )
+        channel_att_sum = None
+        for pool_type in self.pool_types:
+            if pool_type=='avg':
+                avg_pool = F.avg_pool2d( x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
+                channel_att_raw = self.mlp( avg_pool )
+            elif pool_type=='max':
+                max_pool = F.max_pool2d( x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
+                channel_att_raw = self.mlp( max_pool )
+            elif pool_type=='lp':
+                lp_pool = F.lp_pool2d( x, 2, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
+                channel_att_raw = self.mlp( lp_pool )
+            elif pool_type=='lse':
+                # LSE pool only
+                lse_pool = logsumexp_2d(x)
+                channel_att_raw = self.mlp( lse_pool )
 
-class AttentionGate(nn.Module):
-    def __init__(self):
-        super(AttentionGate, self).__init__()
-        kernel_size = 7
-        self.compress = ZPool()
-        self.conv = BasicConv(
-            2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2, relu=False
-        )
+            if channel_att_sum is None:
+                channel_att_sum = channel_att_raw
+            else:
+                channel_att_sum = channel_att_sum + channel_att_raw
 
-    def forward(self, x):
-        x_compress = self.compress(x)
-        x_out = self.conv(x_compress)
-        scale = torch.sigmoid_(x_out)
+        scale = F.sigmoid( channel_att_sum ).unsqueeze(2).unsqueeze(3).expand_as(x)
         return x * scale
 
+def logsumexp_2d(tensor):
+    tensor_flatten = tensor.view(tensor.size(0), tensor.size(1), -1)
+    s, _ = torch.max(tensor_flatten, dim=2, keepdim=True)
+    outputs = s + (tensor_flatten - s).exp().sum(dim=2, keepdim=True).log()
+    return outputs
 
-class TripletAttention(nn.Module):
-    def __init__(self, no_spatial=False):
-        super(TripletAttention, self).__init__()
-        self.cw = AttentionGate()
-        self.hc = AttentionGate()
-        self.no_spatial = no_spatial
-        if not no_spatial:
-            self.hw = AttentionGate()
-
+class ChannelPool(nn.Module):
     def forward(self, x):
-        x_perm1 = x.permute(0, 2, 1, 3).contiguous()
-        x_out1 = self.cw(x_perm1)
-        x_out11 = x_out1.permute(0, 2, 1, 3).contiguous()
-        x_perm2 = x.permute(0, 3, 2, 1).contiguous()
-        x_out2 = self.hc(x_perm2)
-        x_out21 = x_out2.permute(0, 3, 2, 1).contiguous()
-        if not self.no_spatial:
-            x_out = self.hw(x)
-            x_out = 1 / 3 * (x_out + x_out11 + x_out21)
-        else:
-            x_out = 1 / 2 * (x_out11 + x_out21)
-        return x_out
+        return torch.cat( (torch.max(x,1)[0].unsqueeze(1), torch.mean(x,1).unsqueeze(1)), dim=1 )
 
+class SpatialGate(nn.Module):
+    def __init__(self):
+        super(SpatialGate, self).__init__()
+        kernel_size = 7
+        self.compress = ChannelPool()
+        self.spatial = BasicConv(2, 1, kernel_size, stride=1, padding=(kernel_size-1) // 2, relu=False)
+    def forward(self, x):
+        x_compress = self.compress(x)
+        x_out = self.spatial(x_compress)
+        scale = F.sigmoid(x_out) # broadcasting
+        return x * scale
+
+class CBAM(nn.Module):
+    def __init__(self, gate_channels, reduction_ratio=16, pool_types=['avg', 'max'], no_spatial=False):
+        super(CBAM, self).__init__()
+        self.ChannelGate = ChannelGate(gate_channels, reduction_ratio, pool_types)
+        self.no_spatial=no_spatial
+        if not no_spatial:
+            self.SpatialGate = SpatialGate()
+    def forward(self, x):
+        x_out = self.ChannelGate(x)
+        if not self.no_spatial:
+            x_out = self.SpatialGate(x_out)
+        return x_out
+    
 def conv3x3(in_planes, out_planes, stride=1):
     "3x3 convolution with padding"
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
@@ -127,7 +154,7 @@ def conv3x3(in_planes, out_planes, stride=1):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, use_TripletAttention=False):
+    def __init__(self, inplanes, planes, stride=1, downsample=None, use_cbam=False):
         super(BasicBlock, self).__init__()
         self.conv1 = conv3x3(inplanes, planes, stride)
         self.bn1 = nn.BatchNorm2d(planes)
@@ -137,10 +164,10 @@ class BasicBlock(nn.Module):
         self.downsample = downsample
         self.stride = stride
 
-        if use_TripletAttention:
-            self.triatt = TripletAttention( planes, planes )
+        if use_cbam:
+            self.cbam = CBAM( planes, planes )
         else:
-            self.triatt = None
+            self.cbam = None
 
     def forward(self, x):
         residual = x
@@ -149,8 +176,8 @@ class BasicBlock(nn.Module):
         out = self.conv2(out)
         if self.downsample is not None:
             residual = self.downsample(x)
-        if not self.triatt is None:
-            out = self.triatt(out)
+        if not self.cbam is None:
+            out = self.cbam(out)
         out += residual
         out = self.relu(out)
         return out
@@ -162,7 +189,7 @@ def conv5x5(in_planes, out_planes, stride=1):
     
 class BasicBlock(nn.Module):
     expansion = 1
-    def __init__(self, inplanes, planes, stride=1, downsample=None, use_TripletAttention=False):
+    def __init__(self, inplanes, planes, stride=1, downsample=None, use_cbam=False):
         super(BasicBlock, self).__init__()
         self.conv1 = conv5x5(inplanes, planes, stride)
         self.bn1 = nn.BatchNorm2d(planes)
@@ -171,10 +198,10 @@ class BasicBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(planes)
         self.downsample = downsample
         self.stride = stride
-        if use_TripletAttention:
-            self.triatt = TripletAttention( planes, planes )
+        if use_cbam:
+            self.cbam = CBAM( planes, planes )
         else:
-            self.triatt = None
+            self.cbam = None
 
     def forward(self, x):
         residual = x
@@ -183,8 +210,8 @@ class BasicBlock(nn.Module):
         out = self.conv2(out)
         if self.downsample is not None:
             residual = self.downsample(x)
-        if not self.triatt is None:
-            out = self.triatt(out)
+        if not self.cbam is None:
+            out = self.cbam(out)
         out += residual
         out = self.relu(out)
 
